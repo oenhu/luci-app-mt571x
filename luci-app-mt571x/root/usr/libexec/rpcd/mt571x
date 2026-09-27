@@ -1,0 +1,843 @@
+#!/bin/sh
+# rpcd backend microservice for MT5710/MT5711 5G/4G Band Lock & AT Control
+# Object: mt571x
+
+AT_HELPER="/usr/bin/mt571x-at"
+
+# Helper to send AT command and return output & exit code
+run_at() {
+    local cmd="$1"
+    local timeout="${2:-3}"
+    $AT_HELPER -t "$timeout" "$cmd" 2>/dev/null
+}
+
+# --- Action: list ---
+action_list() {
+    cat <<'EOF'
+{
+    "status": {},
+    "capabilities": {},
+    "neighbors": {},
+    "lock_nr_band": { "bands": "array" },
+    "lock_nr_cell": { "band": "string", "arfcn": "string", "scs": "string", "pci": "string" },
+    "lock_nr_freq": { "band": "string", "arfcn": "string" },
+    "unlock_nr": {},
+    "lock_lte_band": { "bands": "array" },
+    "lock_lte_cell": { "band": "string", "earfcn": "string", "pci": "string" },
+    "lock_lte_freq": { "band": "string", "earfcn": "string" },
+    "unlock_lte": {},
+    "unlock_all": {},
+    "restore_auto_mode": {},
+    "set_network_mode": { "mode": "string", "lte_mask": "string" },
+    "reboot_modem": {},
+    "send_at": { "cmd": "string" },
+    "sms_list": {},
+    "sms_recv": {},
+    "sms_delete": { "id": "string", "index": "integer" },
+    "sms_clear_all": {}
+}
+EOF
+}
+
+# --- Action: capabilities ---
+action_capabilities() {
+    cat <<'EOF'
+{
+    "model": "MT5711_CN",
+    "vendor": "TD Tech",
+    "chipset": "HiSilicon Balong",
+    "nr_bands": [
+        {"band": "28", "name": "n28 (700MHz - 广电/移动)", "scs": "0"},
+        {"band": "41", "name": "n41 (2.6GHz - 移动)", "scs": "1"},
+        {"band": "78", "name": "n78 (3.5GHz - 电信/联通)", "scs": "1"},
+        {"band": "79", "name": "n79 (4.9GHz - 移动/广电)", "scs": "1"},
+        {"band": "1",  "name": "n1 (2.1GHz - 联通/电信)", "scs": "1"}
+    ],
+    "lte_bands": [
+        {"band": "1",  "name": "B1 (2100MHz)"},
+        {"band": "3",  "name": "B3 (1800MHz)"},
+        {"band": "5",  "name": "B5 (850MHz)"},
+        {"band": "8",  "name": "B8 (900MHz)"},
+        {"band": "34", "name": "B34 (TD 2000MHz)"},
+        {"band": "38", "name": "B38 (TD 2600MHz)"},
+        {"band": "39", "name": "B39 (TD 1900MHz)"},
+        {"band": "40", "name": "B40 (TD 2300MHz)"},
+        {"band": "41", "name": "B41 (TD 2500MHz)"}
+    ],
+    "modes": [
+        {"mode": "08", "name": "5G NR + LTE 混合 (默认/自动)"},
+        {"mode": "03", "name": "仅 4G LTE"},
+        {"mode": "00", "name": "全网自动 (含 2G/3G/4G/5G)"}
+    ],
+    "features": {
+        "nr_band_lock": true,
+        "nr_cell_lock": true,
+        "nr_freq_lock": true,
+        "lte_band_lock": true,
+        "lte_cell_lock": true,
+        "at_console": true,
+        "neighbor_scan": true,
+        "sms_recv": true
+    }
+}
+EOF
+}
+
+# --- Action: status ---
+action_status() {
+    local at_port
+    at_port=$($AT_HELPER --port 2>/dev/null)
+    if [ -z "$at_port" ] || [ ! -e "$at_port" ]; then
+        jq -n '{
+            online: false,
+            error: "MODEM_OFFLINE",
+            message: "MT5710/MT5711 串口未就绪或未接入"
+        }'
+        return 0
+    fi
+
+    # Query key metrics
+    local hfreq hcsq locinfo nrlock ltelock syscfg temp ssb
+
+    hfreq=$(run_at 'AT^HFREQINFO?' 2 | grep '^\^HFREQINFO:' | tr -d '\r')
+    hcsq=$(run_at 'AT^HCSQ?' 2 | grep '^\^HCSQ:' | tr -d '\r')
+    locinfo=$(run_at 'AT^LOCINFO?' 2 | grep '^\^LOCINFO:' | tr -d '\r')
+    nrlock=$(run_at 'AT^NRFREQLOCK?' 2 | grep -v 'OK' | tr '\r\n' ' ' | sed 's/  */ /g')
+    ltelock=$(run_at 'AT^LTEFREQLOCK?' 2 | grep -v 'OK' | tr '\r\n' ' ' | sed 's/  */ /g')
+    syscfg=$(run_at 'AT^SYSCFGEX?' 2 | grep '^\^SYSCFGEX:' | tr -d '\r')
+    temp=$(run_at 'AT^CHIPTEMP?' 2 | grep '^\^CHIPTEMP:' | tr -d '\r')
+    ssb=$(run_at 'AT^NRSSBID?' 3 | grep '^\^NRSSBID:' | tr -d '\r')
+
+    # Parse HFREQINFO: 0,7,28,153628,768140,20000,142628,713140,20000
+    local band="" dl_arfcn="" dl_freq_mhz="" dl_bw_mhz="" ul_arfcn="" ul_freq_mhz="" ul_bw_mhz=""
+    if [ -n "$hfreq" ]; then
+        local csv="${hfreq#*: }"
+        band=$(echo "$csv" | cut -d, -f3)
+        dl_arfcn=$(echo "$csv" | cut -d, -f4)
+        local dl_freq_k=$(echo "$csv" | cut -d, -f5)
+        local dl_bw_k=$(echo "$csv" | cut -d, -f6)
+        ul_arfcn=$(echo "$csv" | cut -d, -f7)
+        local ul_freq_k=$(echo "$csv" | cut -d, -f8)
+        local ul_bw_k=$(echo "$csv" | cut -d, -f9)
+
+        [ -n "$dl_freq_k" ] && dl_freq_mhz=$(awk -v v="$dl_freq_k" 'BEGIN { printf "%.3f", v / 1000 }')
+        [ -n "$dl_bw_k" ] && dl_bw_mhz=$(awk -v v="$dl_bw_k" 'BEGIN { printf "%.1f", v / 1000 }')
+        [ -n "$ul_freq_k" ] && ul_freq_mhz=$(awk -v v="$ul_freq_k" 'BEGIN { printf "%.3f", v / 1000 }')
+        [ -n "$ul_bw_k" ] && ul_bw_mhz=$(awk -v v="$ul_bw_k" 'BEGIN { printf "%.1f", v / 1000 }')
+    fi
+
+    # Parse HCSQ: "NR",56,201,31
+    local rat="NR" rsrp_raw="" sinr_raw="" rsrq_raw=""
+    local rsrp="" sinr="" rsrq=""
+    if [ -n "$hcsq" ]; then
+        local r=$(echo "$hcsq" | sed -n 's/.*"\([^"]*\)".*/\1/p')
+        [ -n "$r" ] && rat="$r"
+        local vals=$(echo "$hcsq" | sed -n 's/^[^\"]*"[^\"]*",//p')
+        rsrp_raw=$(echo "$vals" | cut -d, -f1)
+        sinr_raw=$(echo "$vals" | cut -d, -f2)
+        rsrq_raw=$(echo "$vals" | cut -d, -f3)
+
+        if [ -n "$rsrp_raw" ]; then
+            rsrp=$(( -140 + rsrp_raw ))
+            [ -n "$sinr_raw" ] && sinr=$(awk -v v="$sinr_raw" 'BEGIN { printf "%.1f", -20.0 + (v * 0.2) }')
+            [ -n "$rsrq_raw" ] && rsrq=$(awk -v v="$rsrq_raw" 'BEGIN { printf "%.1f", -19.5 + (v * 0.5) }')
+        fi
+    fi
+
+    # Parse LOCINFO: 46015,0x465563,0xFF,0x17C5731F7
+    local plmn="" tac="" cell_id="" oper_name="未知运营商"
+    if [ -n "$locinfo" ]; then
+        local l_csv="${locinfo#*: }"
+        plmn=$(echo "$l_csv" | cut -d, -f1 | tr -d ' ')
+        tac=$(echo "$l_csv" | cut -d, -f2 | tr -d ' ')
+        cell_id=$(echo "$l_csv" | cut -d, -f4 | tr -d ' ')
+
+        case "$plmn" in
+            "46000"|"46002"|"46007"|"46008") oper_name="中国移动 (China Mobile)" ;;
+            "46001"|"46006"|"46009") oper_name="中国联通 (China Unicom)" ;;
+            "46003"|"46005"|"46011") oper_name="中国电信 (China Telecom)" ;;
+            "46015") oper_name="中国广电 (China Broadnet)" ;;
+            *) [ -n "$plmn" ] && oper_name="PLMN: $plmn" ;;
+        esac
+    fi
+
+    # Parse SSB Serving Cell: ^NRSSBID: 152650,000000017c5731f7,128,-85,20,...
+    local pci="" ssb_arfcn="" ssb_rsrp="" ssb_sinr=""
+    if [ -n "$ssb" ]; then
+        local ssb_body="${ssb#*: }"
+        ssb_arfcn=$(echo "$ssb_body" | cut -d, -f1)
+        [ -z "$cell_id" ] && cell_id=$(echo "$ssb_body" | cut -d, -f2)
+        pci=$(echo "$ssb_body" | cut -d, -f3)
+        ssb_rsrp=$(echo "$ssb_body" | cut -d, -f4)
+        ssb_sinr=$(echo "$ssb_body" | cut -d, -f5)
+        [ -z "$rsrp" ] && rsrp="$ssb_rsrp"
+        [ -z "$sinr" ] && sinr="$ssb_sinr"
+    fi
+
+    # Parse Temperature: ^CHIPTEMP: 334,...
+    local temp_c=""
+    if [ -n "$temp" ]; then
+        local t_val=$(echo "${temp#*: }" | cut -d, -f1)
+        [ -n "$t_val" ] && temp_c=$(awk -v v="$t_val" 'BEGIN { printf "%.1f", v / 10.0 }')
+    fi
+
+    # Parse Lock Status:
+    local nr_lock_state="0" nr_lock_detail="未锁定"
+    if echo "$nrlock" | grep -q "\^NRFREQLOCK: 0"; then
+        nr_lock_state="0"
+        nr_lock_detail="未锁定"
+    elif echo "$nrlock" | grep -q "\^NRFREQLOCK: 3"; then
+        nr_lock_state="3"
+        local lb=$(echo "$nrlock" | awk -F'0,1 ' '{print $2}' | xargs)
+        nr_lock_detail="已锁定频段: n$lb"
+    elif echo "$nrlock" | grep -q "\^NRFREQLOCK: 2"; then
+        nr_lock_state="2"
+        local lc=$(echo "$nrlock" | awk -F'0,1 ' '{print $2}' | xargs)
+        nr_lock_detail="已锁定小区: $lc"
+    elif echo "$nrlock" | grep -q "\^NRFREQLOCK: 1"; then
+        nr_lock_state="1"
+        local lf=$(echo "$nrlock" | awk -F'0,1 ' '{print $2}' | xargs)
+        nr_lock_detail="已锁定频点: $lf"
+    fi
+
+    local lte_lock_state="0" lte_lock_detail="未锁定"
+    if echo "$ltelock" | grep -q "\^LTEFREQLOCK: 0"; then
+        lte_lock_state="0"
+        lte_lock_detail="未锁定"
+    elif echo "$ltelock" | grep -q "\^LTEFREQLOCK: 3"; then
+        lte_lock_state="3"
+        local lb=$(echo "$ltelock" | awk -F'0,1 ' '{print $2}' | xargs)
+        lte_lock_detail="已锁定频段: B$lb"
+    elif echo "$ltelock" | grep -q "\^LTEFREQLOCK: 2"; then
+        lte_lock_state="2"
+        local lc=$(echo "$ltelock" | awk -F'0,1 ' '{print $2}' | xargs)
+        lte_lock_detail="已锁定小区: $lc"
+    fi
+
+    # Parse SYSCFGEX: "08",0,1,2,1E200000095
+    local current_mode="" lte_band_mask=""
+    if [ -n "$syscfg" ]; then
+        current_mode=$(echo "$syscfg" | sed -n 's/.*"\([^"]*\)".*/\1/p')
+        lte_band_mask=$(echo "${syscfg#*: }" | cut -d, -f5)
+    fi
+
+    # Read configured lock from UCI
+    local conf_nr_mode conf_nr_bands conf_lte_mode conf_lte_bands
+    conf_nr_mode=$(uci -q get mt571x.nr.mode || echo "none")
+    conf_nr_bands=$(uci -q get mt571x.nr.bands || echo "")
+    conf_lte_mode=$(uci -q get mt571x.lte.mode || echo "none")
+    conf_lte_bands=$(uci -q get mt571x.lte.bands || echo "")
+
+    # Output JSON using jq
+    jq -n \
+        --arg online "true" \
+        --arg port "$at_port" \
+        --arg model "MT5711_CN" \
+        --arg vendor "TD Tech Ltd." \
+        --arg rat "$rat" \
+        --arg oper_name "$oper_name" \
+        --arg plmn "$plmn" \
+        --arg band "$band" \
+        --arg dl_arfcn "$dl_arfcn" \
+        --arg dl_freq_mhz "$dl_freq_mhz" \
+        --arg dl_bw_mhz "$dl_bw_mhz" \
+        --arg ul_arfcn "$ul_arfcn" \
+        --arg ul_freq_mhz "$ul_freq_mhz" \
+        --arg ul_bw_mhz "$ul_bw_mhz" \
+        --arg pci "$pci" \
+        --arg cell_id "$cell_id" \
+        --arg tac "$tac" \
+        --arg rsrp "$rsrp" \
+        --arg sinr "$sinr" \
+        --arg rsrq "$rsrq" \
+        --arg temp "$temp_c" \
+        --arg nr_lock_state "$nr_lock_state" \
+        --arg nr_lock_detail "$nr_lock_detail" \
+        --arg lte_lock_state "$lte_lock_state" \
+        --arg lte_lock_detail "$lte_lock_detail" \
+        --arg mode "$current_mode" \
+        --arg lte_mask "$lte_band_mask" \
+        --arg conf_nr_mode "$conf_nr_mode" \
+        --arg conf_nr_bands "$conf_nr_bands" \
+        --arg conf_lte_mode "$conf_lte_mode" \
+        --arg conf_lte_bands "$conf_lte_bands" \
+        '{
+            online: ($online == "true"),
+            port: $port,
+            model: $model,
+            vendor: $vendor,
+            network: {
+                rat: $rat,
+                operator: $oper_name,
+                plmn: $plmn,
+                band: $band,
+                dl_arfcn: (if $dl_arfcn != "" then ($dl_arfcn | tonumber) else null end),
+                dl_freq_mhz: (if $dl_freq_mhz != "" then ($dl_freq_mhz | tonumber) else null end),
+                dl_bw_mhz: (if $dl_bw_mhz != "" then ($dl_bw_mhz | tonumber) else null end),
+                ul_arfcn: (if $ul_arfcn != "" then ($ul_arfcn | tonumber) else null end),
+                ul_freq_mhz: (if $ul_freq_mhz != "" then ($ul_freq_mhz | tonumber) else null end),
+                ul_bw_mhz: (if $ul_bw_mhz != "" then ($ul_bw_mhz | tonumber) else null end),
+                pci: (if $pci != "" then ($pci | tonumber) else null end),
+                cell_id: $cell_id,
+                tac: $tac,
+                mode: $mode,
+                lte_mask: $lte_mask
+            },
+            signal: {
+                rsrp: (if $rsrp != "" then ($rsrp | tonumber) else null end),
+                sinr: (if $sinr != "" then ($sinr | tonumber) else null end),
+                rsrq: (if $rsrq != "" then ($rsrq | tonumber) else null end),
+                temperature: (if $temp != "" then ($temp | tonumber) else null end)
+            },
+            actual_lock: {
+                nr_mode: $nr_lock_state,
+                nr_detail: $nr_lock_detail,
+                lte_mode: $lte_lock_state,
+                lte_detail: $lte_lock_detail
+            },
+            configured_lock: {
+                nr_mode: $conf_nr_mode,
+                nr_bands: $conf_nr_bands,
+                lte_mode: $conf_lte_mode,
+                lte_bands: $conf_lte_bands
+            }
+        }'
+}
+
+# --- Action: neighbors ---
+action_neighbors() {
+    local ssb
+    ssb=$(run_at 'AT^NRSSBID?' 3 | grep '^\^NRSSBID:' | tr -d '\r')
+    if [ -z "$ssb" ]; then
+        echo '{"count": 0, "neighbors": []}'
+        return 0
+    fi
+
+    local body="${ssb#*: }"
+    local serving_arfcn=$(echo "$body" | cut -d, -f1)
+    local serving_pci=$(echo "$body" | cut -d, -f3)
+    local serving_rsrp=$(echo "$body" | cut -d, -f4)
+    local serving_sinr=$(echo "$body" | cut -d, -f5)
+
+    echo "$body" | awk -F',' -v s_pci="$serving_pci" -v s_arfcn="$serving_arfcn" -v s_rsrp="$serving_rsrp" -v s_sinr="$serving_sinr" '
+    BEGIN {
+        print "{\"serving\":{\"pci\":" s_pci ",\"arfcn\":" s_arfcn ",\"rsrp\":" s_rsrp ",\"sinr\":" s_sinr "},\"neighbors\":["
+        first = 1
+    }
+    {
+        count = $23
+        if (count > 0) {
+            idx = 24
+            for (i = 0; i < count; i++) {
+                n_pci = $(idx)
+                n_arfcn = $(idx+1)
+                n_rsrp = $(idx+2)
+                n_sinr = $(idx+3)
+                if (n_pci != "" && n_pci != "255" && n_rsrp < 0) {
+                    if (!first) printf ","
+                    printf "{\"pci\":%d,\"arfcn\":%d,\"rsrp\":%d,\"sinr\":%d}", n_pci, n_arfcn, n_rsrp, n_sinr
+                    first = 0
+                }
+                idx += 14
+            }
+        }
+    }
+    END {
+        print "]}"
+    }'
+}
+
+# --- Action: lock_nr_band ---
+action_lock_nr_band() {
+    local input=$(cat)
+    local bands=$(echo "$input" | jq -r 'if .bands | type == "array" then .bands | join(",") else .bands // "" end' | tr -d ' ')
+    if [ -z "$bands" ]; then
+        jq -n '{success: false, error: "MISSING_BANDS", message: "请指定要锁定的 5G 频段"}'
+        return 0
+    fi
+
+    local count=$(echo "$bands" | tr ',' '\n' | grep -v '^$' | wc -l)
+    if [ "$count" -lt 1 ] || [ "$count" -gt 20 ]; then
+        jq -n '{success: false, error: "INVALID_COUNT", message: "频段数量必须在 1~20 之间"}'
+        return 0
+    fi
+
+    local at_cmd="AT^NRFREQLOCK=3,0,$count,\"$bands\""
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.nr.mode='band'
+        uci set mt571x.nr.bands="$bands"
+        uci commit mt571x
+        run_at 'AT+COPS=0' 3 >/dev/null 2>&1 &
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "已成功锁定 5G 频段 $bands" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="执行失败或超时"
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg err "锁频失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err, cmd: $cmd}'
+    fi
+}
+
+# --- Action: lock_nr_cell ---
+action_lock_nr_cell() {
+    local input=$(cat)
+    local band=$(echo "$input" | jq -r '.band // ""' | tr -d ' ')
+    local arfcn=$(echo "$input" | jq -r '.arfcn // ""' | tr -d ' ')
+    local scs=$(echo "$input" | jq -r '.scs // ""' | tr -d ' ')
+    local pci=$(echo "$input" | jq -r '.pci // ""' | tr -d ' ')
+
+    if [ -z "$band" ] || [ -z "$arfcn" ] || [ -z "$pci" ]; then
+        jq -n '{success: false, error: "MISSING_PARAMS", message: "必须提供 Band、ARFCN 与 PCI"}'
+        return 0
+    fi
+
+    if [ -z "$scs" ]; then
+        if [ "$band" -le 28 ]; then
+            scs="0"
+        else
+            scs="1"
+        fi
+    fi
+
+    local at_cmd="AT^NRFREQLOCK=2,0,1,\"$band\",\"$arfcn\",\"$scs\",\"$pci\""
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.nr.mode='cell'
+        uci set mt571x.nr.bands="$band"
+        uci set mt571x.nr.arfcn="$arfcn"
+        uci set mt571x.nr.pci="$pci"
+        uci set mt571x.nr.scs="$scs"
+        uci commit mt571x
+        run_at 'AT+COPS=0' 3 >/dev/null 2>&1 &
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "已成功锁定 5G 小区 (n$band, ARFCN:$arfcn, PCI:$pci)" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="执行失败或超时"
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg err "锁定小区失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err, cmd: $cmd}'
+    fi
+}
+
+# --- Action: lock_nr_freq ---
+action_lock_nr_freq() {
+    local input=$(cat)
+    local band=$(echo "$input" | jq -r '.band // ""' | tr -d ' ')
+    local arfcn=$(echo "$input" | jq -r '.arfcn // ""' | tr -d ' ')
+
+    if [ -z "$band" ] || [ -z "$arfcn" ]; then
+        jq -n '{success: false, error: "MISSING_PARAMS", message: "必须提供 Band 与 ARFCN"}'
+        return 0
+    fi
+
+    local at_cmd="AT^NRFREQLOCK=1,0,1,\"$band\",\"$arfcn\""
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.nr.mode='freq'
+        uci set mt571x.nr.bands="$band"
+        uci set mt571x.nr.arfcn="$arfcn"
+        uci commit mt571x
+        run_at 'AT+COPS=0' 3 >/dev/null 2>&1 &
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "已成功锁定 5G 频点 (n$band, ARFCN:$arfcn)" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="执行失败或超时"
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg err "锁定频点失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err, cmd: $cmd}'
+    fi
+}
+
+# --- Action: unlock_nr ---
+action_unlock_nr() {
+    local res
+    res=$(run_at 'AT^NRFREQLOCK=0' 4)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.nr.mode='none'
+        uci set mt571x.nr.bands=''
+        uci set mt571x.nr.arfcn=''
+        uci set mt571x.nr.pci=''
+        uci commit mt571x
+        run_at 'AT+COPS=0' 3 >/dev/null 2>&1 &
+        jq -n '{success: true, message: "已成功解除 5G 频段/小区锁定"}'
+    else
+        jq -n '{success: false, error: "AT_ERROR", message: "解除 5G 锁定失败"}'
+    fi
+}
+
+# --- Action: lock_lte_band ---
+action_lock_lte_band() {
+    local input=$(cat)
+    local bands=$(echo "$input" | jq -r 'if .bands | type == "array" then .bands | join(",") else .bands // "" end' | tr -d ' ')
+    if [ -z "$bands" ]; then
+        jq -n '{success: false, error: "MISSING_BANDS", message: "请指定要锁定的 4G 频段"}'
+        return 0
+    fi
+
+    local count=$(echo "$bands" | tr ',' '\n' | grep -v '^$' | wc -l)
+    local at_cmd="AT^LTEFREQLOCK=3,0,$count,\"$bands\""
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.lte.mode='band'
+        uci set mt571x.lte.bands="$bands"
+        uci commit mt571x
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "已成功锁定 4G 频段 $bands" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="执行失败或超时"
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg err "4G 锁频失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err, cmd: $cmd}'
+    fi
+}
+
+# --- Action: lock_lte_cell ---
+action_lock_lte_cell() {
+    local input=$(cat)
+    local band=$(echo "$input" | jq -r '.band // ""' | tr -d ' ')
+    local earfcn=$(echo "$input" | jq -r '.earfcn // ""' | tr -d ' ')
+    local pci=$(echo "$input" | jq -r '.pci // ""' | tr -d ' ')
+
+    if [ -z "$band" ] || [ -z "$earfcn" ] || [ -z "$pci" ]; then
+        jq -n '{success: false, error: "MISSING_PARAMS", message: "必须提供 Band、EARFCN 与 PCI"}'
+        return 0
+    fi
+
+    local at_cmd="AT^LTEFREQLOCK=2,0,1,\"$band\",\"$earfcn\",\"$pci\""
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.lte.mode='cell'
+        uci set mt571x.lte.bands="$band"
+        uci set mt571x.lte.earfcn="$earfcn"
+        uci set mt571x.lte.pci="$pci"
+        uci commit mt571x
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "已成功锁定 4G 小区 (B$band, EARFCN:$earfcn, PCI:$pci)" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="执行失败或超时"
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg err "锁定 4G 小区失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err, cmd: $cmd}'
+    fi
+}
+
+# --- Action: lock_lte_freq ---
+action_lock_lte_freq() {
+    local input=$(cat)
+    local band=$(echo "$input" | jq -r '.band // ""' | tr -d ' ')
+    local earfcn=$(echo "$input" | jq -r '.earfcn // ""' | tr -d ' ')
+
+    if [ -z "$band" ] || [ -z "$earfcn" ]; then
+        jq -n '{success: false, error: "MISSING_PARAMS", message: "必须提供 Band 与 EARFCN"}'
+        return 0
+    fi
+
+    local at_cmd="AT^LTEFREQLOCK=1,0,1,\"$band\",\"$earfcn\""
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.lte.mode='freq'
+        uci set mt571x.lte.bands="$band"
+        uci set mt571x.lte.earfcn="$earfcn"
+        uci commit mt571x
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "已成功锁定 4G 频点 (B$band, EARFCN:$earfcn)" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="执行失败或超时"
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg err "锁定 4G 频点失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err, cmd: $cmd}'
+    fi
+}
+
+# --- Action: unlock_lte ---
+action_unlock_lte() {
+    local res
+    res=$(run_at 'AT^LTEFREQLOCK=0' 4)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        uci set mt571x.lte.mode='none'
+        uci set mt571x.lte.bands=''
+        uci set mt571x.lte.earfcn=''
+        uci set mt571x.lte.pci=''
+        uci commit mt571x
+        jq -n '{success: true, message: "已成功解除 4G 频段/小区锁定"}'
+    else
+        jq -n '{success: false, error: "AT_ERROR", message: "解除 4G 锁定失败"}'
+    fi
+}
+
+# --- Action: unlock_all ---
+action_unlock_all() {
+    run_at 'AT^NRFREQLOCK=0' 4
+    run_at 'AT^LTEFREQLOCK=0' 4
+
+    uci set mt571x.nr.mode='none'
+    uci set mt571x.nr.bands=''
+    uci set mt571x.nr.arfcn=''
+    uci set mt571x.nr.pci=''
+    uci set mt571x.lte.mode='none'
+    uci set mt571x.lte.bands=''
+    uci set mt571x.lte.earfcn=''
+    uci set mt571x.lte.pci=''
+    uci commit mt571x
+    run_at 'AT+COPS=0' 3 >/dev/null 2>&1 &
+
+    jq -n '{success: true, message: "已成功解除 5G 与 4G 的所有锁定限制"}'
+}
+
+# --- Action: restore_auto_mode ---
+action_restore_auto_mode() {
+    run_at 'AT^NRFREQLOCK=0' 3
+    run_at 'AT^LTEFREQLOCK=0' 3
+    run_at 'AT^SYSCFGEX="08",0,1,2,7FFFFFFFFFFFFFFF' 5
+
+    uci set mt571x.nr.mode='none'
+    uci set mt571x.nr.bands=''
+    uci set mt571x.lte.mode='none'
+    uci set mt571x.lte.bands=''
+    uci commit mt571x
+
+    jq -n '{success: true, message: "已恢复出厂 5G+LTE 自动搜索模式及全频段掩码"}'
+}
+
+# --- Action: set_network_mode ---
+action_set_network_mode() {
+    local input=$(cat)
+    local mode=$(echo "$input" | jq -r '.mode // "08"' | tr -d ' ')
+    local mask=$(echo "$input" | jq -r '.lte_mask // "7FFFFFFFFFFFFFFF"' | tr -d ' ')
+
+    local at_cmd="AT^SYSCFGEX=\"$mode\",0,1,2,$mask"
+    local res
+    res=$(run_at "$at_cmd" 5)
+    local rc=$?
+    if [ "$rc" -eq 0 ] && ! echo "$res" | grep -qi "ERROR"; then
+        jq -n \
+            --arg cmd "$at_cmd" \
+            --arg msg "网络制式与频段掩码设置成功" \
+            '{success: true, cmd: $cmd, message: $msg}'
+    else
+        local err=$(echo "$res" | grep -E 'ERROR|\+CME' | head -n1 | tr -d '\r')
+        [ -z "$err" ] && err="设置失败或超时"
+        jq -n \
+            --arg err "设置模式失败: $err" \
+            '{success: false, error: "AT_ERROR", message: $err}'
+    fi
+}
+
+# --- Action: reboot_modem ---
+action_reboot_modem() {
+    (
+        sleep 1
+        $AT_HELPER -t 2 "AT+CFUN=1,1" >/dev/null 2>&1
+    ) &
+    jq -n '{success: true, message: "蜂窝模组正在软重启中 (预计 15~30 秒重新连接)"}'
+}
+
+# --- Action: send_at ---
+action_send_at() {
+    local input=$(cat)
+    local cmd=$(echo "$input" | jq -r '.cmd // ""' | tr -d '\r\n')
+
+    if [ -z "$cmd" ]; then
+        jq -n '{success: false, error: "EMPTY_COMMAND", message: "AT 指令不能为空"}'
+        return 0
+    fi
+
+    case "$cmd" in
+        AT*|at*|At*|aT*) ;;
+        *)
+            jq -n '{success: false, error: "INVALID_PREFIX", message: "指令必须以 AT 开头"}'
+            return 0
+            ;;
+    esac
+
+    case "$cmd" in
+        *";"*|*"|"*|*"&"*|*"\`"*|*"$"*)
+            jq -n '{success: false, error: "DISALLOWED_CHAR", message: "指令包含非法字符"}'
+            return 0
+            ;;
+    esac
+
+    if [ "${#cmd}" -gt 256 ]; then
+        jq -n '{success: false, error: "TOO_LONG", message: "指令长度超出 256 字符限制"}'
+        return 0
+    fi
+
+    local res=$(run_at "$cmd" 5)
+    jq -n \
+        --arg cmd "$cmd" \
+        --arg response "$res" \
+        '{
+            success: true,
+            cmd: $cmd,
+            response: $response
+        }'
+}
+
+# --- Action: sms_recv ---
+action_sms_recv() {
+    local raw
+    raw=$($AT_HELPER --sms-recv 2>/dev/null)
+    local rc=$?
+
+    if [ "$rc" -ne 0 ] || ! echo "$raw" | jq . >/dev/null 2>&1; then
+        raw='{"msg":[]}'
+    fi
+
+    local current_json='{"messages":[]}'
+    if [ -f /tmp/mt571x_sms.json ]; then
+        current_json=$(cat /tmp/mt571x_sms.json 2>/dev/null)
+        if ! echo "$current_json" | jq . >/dev/null 2>&1; then
+            current_json='{"messages":[]}'
+        fi
+    fi
+
+    local merged
+    merged=$(jq -n \
+        --argjson incoming "$raw" \
+        --argjson existing "$current_json" '
+        ($incoming.msg // []) as $new_msgs |
+        ($existing.messages // []) as $old_msgs |
+        ($new_msgs | map({
+            id: ((.sender // "unknown") + "_" + (.timestamp // "") + "_" + (.index | tostring)),
+            index: .index,
+            sender: (.sender // "未知号码"),
+            timestamp: (.timestamp // "未知时间"),
+            content: (.content // ""),
+            storage: "SIM",
+            received_at: (now | strftime("%Y-%m-%d %H:%M:%S"))
+        })) as $formatted_new |
+        ($formatted_new + $old_msgs | unique_by(.sender + .timestamp + .content)) as $all |
+        {
+            success: true,
+            count: ($all | length),
+            messages: $all,
+            updated_at: (now | strftime("%Y-%m-%d %H:%M:%S"))
+        }
+    ' 2>/dev/null)
+
+    if [ -n "$merged" ]; then
+        echo "$merged" > /tmp/mt571x_sms.json
+        echo "$merged"
+    else
+        echo '{"success": false, "count": 0, "messages": [], "error": "PARSE_FAILED"}'
+    fi
+}
+
+# --- Action: sms_list ---
+action_sms_list() {
+    if [ -f /tmp/mt571x_sms.json ]; then
+        cat /tmp/mt571x_sms.json
+    else
+        action_sms_recv
+    fi
+}
+
+# --- Action: sms_delete ---
+action_sms_delete() {
+    local input=$(cat)
+    local target_id=$(echo "$input" | jq -r '.id // ""')
+    local target_index=$(echo "$input" | jq -r '.index // ""')
+
+    if [ -n "$target_index" ] && [ "$target_index" != "null" ]; then
+        run_at "AT+CMGD=$target_index" 4 >/dev/null 2>&1
+    fi
+
+    if [ -f /tmp/mt571x_sms.json ] && [ -n "$target_id" ]; then
+        local updated
+        updated=$(jq --arg id "$target_id" '
+            .messages = (.messages | map(select(.id != $id))) |
+            .count = (.messages | length) |
+            .updated_at = (now | strftime("%Y-%m-%d %H:%M:%S"))
+        ' /tmp/mt571x_sms.json 2>/dev/null)
+        if [ -n "$updated" ]; then
+            echo "$updated" > /tmp/mt571x_sms.json
+        fi
+    fi
+
+    jq -n '{success: true, message: "短信已删除"}'
+}
+
+# --- Action: sms_clear_all ---
+action_sms_clear_all() {
+    run_at "AT+CMGD=1,4" 4 >/dev/null 2>&1
+    echo '{"success": true, "count": 0, "messages": [], "updated_at": ""}' > /tmp/mt571x_sms.json
+    jq -n '{success: true, message: "已清空所有临时短信与 SIM 卡短信"}'
+}
+
+# --- Main Dispatcher ---
+case "$1" in
+    list)
+        action_list
+        ;;
+    call)
+        case "$2" in
+            status)            action_status ;;
+            capabilities)      action_capabilities ;;
+            neighbors)         action_neighbors ;;
+            lock_nr_band)      action_lock_nr_band ;;
+            lock_nr_cell)      action_lock_nr_cell ;;
+            lock_nr_freq)      action_lock_nr_freq ;;
+            unlock_nr)         action_unlock_nr ;;
+            lock_lte_band)     action_lock_lte_band ;;
+            lock_lte_cell)     action_lock_lte_cell ;;
+            lock_lte_freq)     action_lock_lte_freq ;;
+            unlock_lte)        action_unlock_lte ;;
+            unlock_all)        action_unlock_all ;;
+            restore_auto_mode) action_restore_auto_mode ;;
+            set_network_mode)  action_set_network_mode ;;
+            reboot_modem)      action_reboot_modem ;;
+            send_at)           action_send_at ;;
+            sms_list)          action_sms_list ;;
+            sms_recv)          action_sms_recv ;;
+            sms_delete)        action_sms_delete ;;
+            sms_clear_all)     action_sms_clear_all ;;
+            *)
+                jq -n '{error: "METHOD_NOT_FOUND"}'
+                exit 0
+                ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $0 {list|call <method>}" >&2
+        exit 1
+        ;;
+esac

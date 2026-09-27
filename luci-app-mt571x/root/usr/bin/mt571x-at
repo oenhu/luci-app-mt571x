@@ -1,0 +1,172 @@
+#!/bin/sh
+# mt571x-at: AT command execution helper with dynamic port discovery and flock serialization
+# TD Tech MT5710/MT5711 (HiSilicon Balong)
+
+LOCK_FILE="/var/lock/mt571x-at.lock"
+LINK_DEV="/dev/mt571x-at"
+TARGET_VID="3466"
+TARGET_PID="3301"
+TARGET_IFN="03"
+DEFAULT_TIMEOUT=3
+
+# 1. Check & ensure option driver binding
+ensure_driver_binding() {
+    local found=0
+    for u in /sys/bus/usb/devices/*; do
+        if [ -f "$u/idVendor" ] && [ -f "$u/idProduct" ]; then
+            if [ "$(cat "$u/idVendor" 2>/dev/null)" = "$TARGET_VID" ] && [ "$(cat "$u/idProduct" 2>/dev/null)" = "$TARGET_PID" ]; then
+                found=1
+                break
+            fi
+        fi
+    done
+    [ "$found" -eq 1 ] || return 1
+
+    if [ ! -d /sys/bus/usb-serial/drivers/option1 ]; then
+        modprobe option 2>/dev/null
+    fi
+
+    if [ -f /sys/bus/usb-serial/drivers/option1/new_id ]; then
+        local bound=0
+        for dev in /sys/class/tty/ttyUSB*; do
+            [ -d "$dev" ] || continue
+            local usb_dev=$(readlink -f "$dev/device" 2>/dev/null)
+            local p="$usb_dev"
+            while [ -n "$p" ] && [ "$p" != "/" ] && [ ! -f "$p/idVendor" ]; do
+                p=$(dirname "$p")
+            done
+            if [ -f "$p/idVendor" ] && [ "$(cat "$p/idVendor" 2>/dev/null)" = "$TARGET_VID" ]; then
+                bound=1
+                break
+            fi
+        done
+        if [ "$bound" -eq 0 ]; then
+            echo "$TARGET_VID $TARGET_PID ff" > /sys/bus/usb-serial/drivers/option1/new_id 2>/dev/null
+            sleep 1
+        fi
+    fi
+    return 0
+}
+
+# 2. Dynamic AT port discovery
+find_at_port() {
+    local target_tty=""
+    local retry=0
+
+    while [ "$retry" -le 1 ]; do
+        for dev in /sys/class/tty/ttyUSB*; do
+            [ -d "$dev" ] || continue
+            local tty=$(basename "$dev")
+            local usb_dev=$(readlink -f "$dev/device" 2>/dev/null)
+            local p="$usb_dev"
+            while [ -n "$p" ] && [ "$p" != "/" ] && [ ! -f "$p/idVendor" ]; do
+                p=$(dirname "$p")
+            done
+            if [ -f "$p/idVendor" ] && [ -f "$p/idProduct" ]; then
+                local vid=$(cat "$p/idVendor" 2>/dev/null)
+                local pid=$(cat "$p/idProduct" 2>/dev/null)
+                local ifn=$(cat "$usb_dev/bInterfaceNumber" 2>/dev/null || cat "$(dirname "$usb_dev")/bInterfaceNumber" 2>/dev/null)
+                if [ "$vid" = "$TARGET_VID" ] && [ "$pid" = "$TARGET_PID" ] && [ "$ifn" = "$TARGET_IFN" ]; then
+                    target_tty="/dev/$tty"
+                    break
+                fi
+            fi
+        done
+
+        if [ -n "$target_tty" ] && [ -e "$target_tty" ]; then
+            ln -sf "$target_tty" "$LINK_DEV" 2>/dev/null
+            echo "$target_tty"
+            return 0
+        fi
+
+        # If not found on first attempt, attempt auto-driver binding and retry once
+        if [ "$retry" -eq 0 ]; then
+            ensure_driver_binding >/dev/null 2>&1
+            sleep 1
+        fi
+        retry=$((retry + 1))
+    done
+
+    if [ -e "$LINK_DEV" ]; then
+        local real=$(readlink -f "$LINK_DEV" 2>/dev/null)
+        if [ -n "$real" ] && [ -e "$real" ]; then
+            echo "$real"
+            return 0
+        fi
+    fi
+
+    if [ -e "/dev/ttyUSB1" ]; then
+        echo "/dev/ttyUSB1"
+        return 0
+    fi
+
+    return 1
+}
+
+if [ "$1" = "--ensure-driver" ]; then
+    ensure_driver_binding
+    exit $?
+fi
+
+if [ "$1" = "--port" ]; then
+    ensure_driver_binding >/dev/null 2>&1
+    port=$(find_at_port)
+    if [ -n "$port" ]; then
+        echo "$port"
+        exit 0
+    else
+        echo "NOT_FOUND" >&2
+        exit 1
+    fi
+fi
+
+if [ "$1" = "--sms-recv" ]; then
+    ensure_driver_binding >/dev/null 2>&1
+    port=$(find_at_port)
+    if [ -z "$port" ] || [ ! -e "$port" ]; then
+        echo '{"error": "PORT_NOT_FOUND", "msg": []}'
+        exit 1
+    fi
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    touch "$LOCK_FILE"
+    if [ -x /usr/bin/sms_tool_q ]; then
+        flock "$LOCK_FILE" -c "/usr/bin/sms_tool_q -t 6 -d '$port' -s SM -j recv 2>/dev/null"
+    else
+        echo '{"error": "NO_SMS_TOOL", "msg": []}'
+    fi
+    exit 0
+fi
+
+TIMEOUT="$DEFAULT_TIMEOUT"
+if [ "$1" = "-t" ]; then
+    TIMEOUT="$2"
+    shift 2
+fi
+
+CMD="$*"
+if [ -z "$CMD" ]; then
+    echo "Usage: mt571x-at [-t timeout] <AT_COMMAND>" >&2
+    exit 1
+fi
+
+ensure_driver_binding >/dev/null 2>&1
+
+PORT=$(find_at_port)
+if [ -z "$PORT" ] || [ ! -e "$PORT" ]; then
+    echo "ERROR: AT_PORT_NOT_FOUND" >&2
+    exit 2
+fi
+
+CMD_CLEAN=$(printf '%s' "$CMD" | tr -d '\r\n')
+
+# Use flock serialization with sms_tool_q
+mkdir -p "$(dirname "$LOCK_FILE")"
+touch "$LOCK_FILE"
+
+if [ -x /usr/bin/sms_tool_q ]; then
+    flock "$LOCK_FILE" -c "/usr/bin/sms_tool_q -t $TIMEOUT -d '$PORT' at '$CMD_CLEAN'"
+elif [ -x /usr/bin/tom_modem ]; then
+    flock "$LOCK_FILE" -c "/usr/bin/tom_modem -d '$PORT' -c '$CMD_CLEAN' -t $TIMEOUT"
+else
+    flock "$LOCK_FILE" -c "stty -F '$PORT' 115200 raw -echo 2>/dev/null; printf '%s\r\n' '$CMD_CLEAN' > '$PORT'; head -n 20 '$PORT'"
+fi

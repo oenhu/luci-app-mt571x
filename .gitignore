@@ -1,0 +1,34 @@
+# Sensitive keys and developer credentials
+.ssh_key*
+ssh_router.sh
+*.pem
+*.key
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+._*
+.Spotlight-V100
+.Trashes
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and log files
+*.log
+/tmp/
+
+# Editor directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OpenWrt SDK build artifacts (if compiled locally)
+/bin/
+/build_dir/
+/staging_dir/
+/dl/
+/feeds/

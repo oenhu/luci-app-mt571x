@@ -1,0 +1,20 @@
+{
+	"admin/modem": {
+		"title": "Modem",
+		"order": 25,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/modem/mt571x": {
+		"title": "5G/4G 锁频控制",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "modem/mt571x"
+		},
+		"depends": {
+			"acl": [ "luci-app-mt571x" ]
+		}
+	}
+}

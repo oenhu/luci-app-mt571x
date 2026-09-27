@@ -1,0 +1,43 @@
+#!/bin/sh
+# Hotplug handler for TD Tech MT5710/MT5711 (3466:3301)
+
+TARGET_VID="3466"
+TARGET_PID="3301"
+
+case "$ACTION" in
+    bind|add)
+        is_target=0
+        if echo "$PRODUCT" | grep -qi "$TARGET_VID/$TARGET_PID"; then
+            is_target=1
+        elif [ -n "$DEVICENAME" ] && [ -f "/sys/bus/usb/devices/$DEVICENAME/idVendor" ]; then
+            vid=$(cat "/sys/bus/usb/devices/$DEVICENAME/idVendor" 2>/dev/null)
+            pid=$(cat "/sys/bus/usb/devices/$DEVICENAME/idProduct" 2>/dev/null)
+            if [ "$vid" = "$TARGET_VID" ] && [ "$pid" = "$TARGET_PID" ]; then
+                is_target=1
+            fi
+        fi
+
+        if [ "$is_target" -eq 1 ]; then
+            logger -t mt571x-hotplug "Detected MT5710/MT5711 USB attach: $ACTION"
+            (
+                sleep 1
+                /usr/bin/mt571x-at --ensure-driver
+                /usr/bin/mt571x-at --port >/dev/null 2>&1
+            ) &
+        fi
+        ;;
+    remove)
+        # If the target device was unplugged, clean up stale link
+        found=0
+        for u in /sys/bus/usb/devices/*; do
+            if [ -f "$u/idVendor" ] && [ "$(cat "$u/idVendor" 2>/dev/null)" = "$TARGET_VID" ]; then
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            rm -f /dev/mt571x-at 2>/dev/null
+            logger -t mt571x-hotplug "MT5710/MT5711 USB device detached"
+        fi
+        ;;
+esac

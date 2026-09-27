@@ -1,0 +1,40 @@
+{
+	"luci-app-mt571x": {
+		"description": "Grant access to MT5710/MT5711 5G/4G Band Lock & AT Control",
+		"read": {
+			"ubus": {
+				"mt571x": [
+					"status",
+					"capabilities",
+					"neighbors",
+					"sms_list",
+					"sms_recv"
+				]
+			},
+			"uci": [ "mt571x" ]
+		},
+		"write": {
+			"ubus": {
+				"mt571x": [
+					"lock_nr_band",
+					"lock_nr_cell",
+					"lock_nr_freq",
+					"unlock_nr",
+					"lock_lte_band",
+					"lock_lte_cell",
+					"lock_lte_freq",
+					"unlock_lte",
+					"unlock_all",
+					"restore_auto_mode",
+					"set_network_mode",
+					"reboot_modem",
+					"send_at",
+					"sms_recv",
+					"sms_delete",
+					"sms_clear_all"
+				]
+			},
+			"uci": [ "mt571x" ]
+		}
+	}
+}
